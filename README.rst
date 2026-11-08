@@ -73,12 +73,12 @@ Updates remain serial by default. Opt in with a positive job count::
 path. Import providers are always updated synchronously with live output
 before the remaining ordinary projects can run concurrently.
 
-Buffered mode displays each completed project's stdout and stderr without
-waiting for earlier projects in the manifest. Ordering between the two
-streams is not preserved. Git sees a non-terminal output sink, so its
+Buffered mode displays each completed project's stdout and stderr in observed
+arrival order without waiting for earlier projects in the manifest. Output is
+spooled to disk rather than retained in memory. Git sees a non-terminal sink, so its
 automatic colors and progress may differ; explicit Git color settings and
 West's ``color.ui`` setting remain effective. Use ``--unbuffered`` for live
-terminal output, not to enable concurrent interactive input.
+terminal output and credential/passphrase prompts.
 
 When buffered updates can run concurrently and stderr is a terminal, a
 temporary status line shows the completed project count and currently running
@@ -88,22 +88,16 @@ keep plain output without status redraws.
 Only the transient display normalizes combining characters for terminal
 compatibility; project names and replayed logs are unchanged.
 
-Parallel operations must not need coordinated credential prompts, rebase
-editors, signing/pinentry, hooks or other interactive helpers. Use the serial
-default for these workflows. Interruption stops pending work and cleans up
-this invocation's owned Git children and output buffers; completed updates
-are not rolled back. Detached external helpers are not a process-lifecycle API.
-
-On cancellation, running commands share a two-second grace period before
-remaining owned processes are forcefully stopped. POSIX sends SIGTERM first;
-Windows allows current Git commands to finish naturally. Forceful termination
-can leave Git lock files, so West warns about potentially affected projects.
-If a later Git command reports a lock, check that no Git process is using the
-repository before manually removing a confirmed stale lock. West never removes
-Git lock files automatically.
+Git stays in the foreground process group, so terminal Ctrl-C reaches Git's own
+signal handlers. Interruption or a fatal error stops pending work and waits for
+already-running commands without force-killing Git or its helpers. A signal
+sent only to West, rather than its terminal group, may therefore wait for Git
+to finish. Completed updates are not rolled back. Use the serial default when
+multiple simultaneous prompts or other interactive helpers would be confusing.
 
 Before ordinary parallel work, West checks selected project paths and existing
-Git common directories. Projects connected by overlapping paths or shared Git
+Git common directories using standard on-disk metadata; overridden or unusual
+layouts may require a Git probe. Projects connected by overlapping paths or shared Git
 metadata form a conflict group. A warning identifies these conflicts; members
 of each group run in their original order while independent groups can run
 concurrently. Output is still replayed after each project, not after the entire

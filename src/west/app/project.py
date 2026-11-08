@@ -1811,37 +1811,34 @@ class Update(_ProjectCommand):
                 self.die(f'{project.name}: cannot inspect Git metadata in {path}: {error}')
 
             try:
-                result = project.git(
-                    ['rev-parse', '--git-common-dir'],
-                    cwd=project.abspath,
-                    capture_stdout=True,
-                    capture_stderr=True,
-                )
+                common = self._git_common_dir(path)
+                if common is None:
+                    result = project.git(
+                        ['rev-parse', '--git-common-dir'],
+                        cwd=project.abspath,
+                        capture_stdout=True,
+                        capture_stderr=True,
+                    )
+                    if result.returncode:
+                        raise ValueError(
+                            f'Git common-directory inspection failed: {result.stderr!r}'
+                        )
+                    answer = result.stdout
+                    if not isinstance(answer, bytes) or not answer.rstrip(b'\r\n'):
+                        raise ValueError('Git common-directory inspection returned empty output')
+                    common = Path(os.fsdecode(answer.rstrip(b'\r\n')))
+                    if not common.is_absolute():
+                        common = path / common
+                common = self._normalized_path(common)
+                info = common.stat()
+                if not stat.S_ISDIR(info.st_mode):
+                    raise ValueError(f'{common} is not a directory')
             except subprocess.CalledProcessError as error:
                 detail = (error.stderr or b'').decode(Manifest.encoding, errors='backslashreplace')
                 self.die(
                     f'{project.name}: Git common-directory inspection failed in {path}: '
                     f'{detail or error}'
                 )
-            if result.returncode:
-                self.die(
-                    f'{project.name}: Git common-directory inspection failed in {path}: '
-                    f'{result.stderr!r}'
-                )
-            answer = result.stdout
-            if not isinstance(answer, bytes) or not answer.rstrip(b'\r\n'):
-                self.die(
-                    f'{project.name}: Git common-directory inspection returned empty output '
-                    f'in {path}'
-                )
-            try:
-                common = Path(os.fsdecode(answer.rstrip(b'\r\n')))
-                if not common.is_absolute():
-                    common = path / common
-                common = self._normalized_path(common)
-                info = common.stat()
-                if not stat.S_ISDIR(info.st_mode):
-                    raise ValueError(f'{common} is not a directory')
             except (OSError, ValueError, RuntimeError) as error:
                 self.die(f'{project.name}: unusable Git common directory in {path}: {error}')
             identity = info.st_dev, info.st_ino
@@ -1853,6 +1850,28 @@ class Update(_ProjectCommand):
         for index, project in enumerate(projects):
             groups.setdefault(root(index), []).append(project)
         return list(groups.values()), conflicts
+
+    @staticmethod
+    def _git_common_dir(path: Path) -> Path | None:
+        # Let Git resolve overrides and nonstandard metadata layouts.
+        if any(
+            name in os.environ
+            for name in ('GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_CEILING_DIRECTORIES')
+        ):
+            return None
+        gitdir = path / '.git'
+        if gitdir.is_file():
+            content = gitdir.read_bytes().rstrip(b'\r\n')
+            if not content.startswith(b'gitdir: '):
+                return None
+            gitdir = path / os.fsdecode(content[len(b'gitdir: ') :])
+        if not gitdir.is_dir():
+            return None
+        try:
+            common = (gitdir / 'commondir').read_bytes().rstrip(b'\r\n')
+        except FileNotFoundError:
+            return gitdir
+        return gitdir / os.fsdecode(common) if common else None
 
     def _update_projects(self, projects: Iterable[Project]) -> list[Project]:
         if self.args.jobs == 1:
@@ -1898,7 +1917,7 @@ class Update(_ProjectCommand):
                 f'Updating with up to {jobs} parallel jobs; output is buffered '
                 'until each project completes (--unbuffered for live output).'
             )
-        controller = _execution.ProcessController()
+        cancelled = threading.Event()
         executor: concurrent.futures.ThreadPoolExecutor | None = None
         running: dict[
             concurrent.futures.Future[None],
@@ -1912,16 +1931,18 @@ class Update(_ProjectCommand):
 
         def run_project(project: Project, scope: _execution.ProjectContext) -> None:
             with scope.activate():
-                controller.check()
+                if cancelled.is_set():
+                    raise concurrent.futures.CancelledError()
                 auto_key = cache_keys.get(project.name)
                 # fetch() may use this source even after a higher-priority cache clone.
                 cache_lock = cache_locks[auto_key] if auto_key is not None else None
                 with cache_lock if cache_lock is not None else nullcontext():
-                    controller.check()
+                    if cancelled.is_set():
+                        raise concurrent.futures.CancelledError()
                     self.update(project)
 
         def new_scope(project: Project) -> _execution.ProjectContext:
-            scope = _execution.ProjectContext(controller, buffered=buffered)
+            scope = _execution.ProjectContext(cancelled, buffered=buffered)
             open_scopes.append((project, scope))
             return scope
 
@@ -1998,6 +2019,7 @@ class Update(_ProjectCommand):
             complete = True
         finally:
             original_error = sys.exc_info()[1]
+            replacement_error: BaseException | None = None
             cleanup_errors: list[tuple[str, OSError | ValueError]] = []
             if status is not None:
                 try:
@@ -2005,14 +2027,22 @@ class Update(_ProjectCommand):
                 except (OSError, ValueError) as error:
                     cleanup_errors.append(('clearing update status', error))
             if not complete:
+                cancelled.set()
                 for future in running:
                     future.cancel()
-                try:
-                    controller.cancel()
-                except OSError as error:
-                    cleanup_errors.append(('stopping owned Git children', error))
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
+                if isinstance(original_error, concurrent.futures.CancelledError):
+                    for future in running:
+                        if future.cancelled():
+                            continue
+                        future_error = future.exception()
+                        if future_error is not None and not isinstance(
+                            future_error,
+                            (concurrent.futures.CancelledError, subprocess.CalledProcessError),
+                        ):
+                            replacement_error = original_error = future_error
+                            break
             for project, scope in open_scopes:
                 if not isinstance(original_error, BrokenPipeError):
                     try:
@@ -2023,24 +2053,6 @@ class Update(_ProjectCommand):
                     scope.close()
                 except (OSError, ValueError) as error:
                     cleanup_errors.append((f'closing {project.name} output', error))
-            try:
-                controller.close()
-            except OSError as error:
-                cleanup_errors.append(('closing owned Git resources', error))
-            if controller.forced_termination:
-                affected = (
-                    ', '.join(f'{project.name} ({project.abspath})' for project, _ in open_scopes)
-                    or 'repositories updated by this invocation'
-                )
-                try:
-                    self.wrn(
-                        f'Git was forcefully stopped while updating {affected}. '
-                        'Git lock files may remain. If a later Git command reports a lock, '
-                        'check that no Git process is using that repository before removing '
-                        'a confirmed stale lock manually; West does not remove Git locks.'
-                    )
-                except (OSError, ValueError) as error:
-                    cleanup_errors.append(('reporting forced Git termination', error))
             reporting_errors = []
             for operation, cleanup_error in cleanup_errors:
                 try:
@@ -2055,6 +2067,8 @@ class Update(_ProjectCommand):
                 if original_error is not None:
                     raise original_error from cleanup_failure
                 raise cleanup_failure
+            if replacement_error is not None:
+                raise replacement_error
         return [project for project in selected if project.name in failed_names]
 
     def toplevel_projects(self):

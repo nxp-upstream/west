@@ -16,7 +16,6 @@ import yaml
 from conftest import GIT, create_repo, create_workspace
 from test_execution import process_active, wait_until
 
-from west import _execution
 from west.app import main as west_main
 
 CLI_DRIVER = '''
@@ -76,7 +75,7 @@ kernel.FreeConsole()
 @pytest.mark.parametrize(
     'shell', ['direct', 'cmd', 'powershell'] if sys.platform == 'win32' else ['direct']
 )
-def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buffered, shell):
+def test_cli_terminal_interrupt_reaches_git_and_stops_pending_work(tmp_path, buffered, shell):
     remote = tmp_path / 'remote'
     create_repo(remote)
     workspace = tmp_path / 'workspace'
@@ -100,26 +99,36 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
     exit_status = tmp_path / 'exit-status'
     driver = tmp_path / 'west interrupt driver.py'
     driver.write_text(CLI_DRIVER, encoding='utf-8')
-    helper = tmp_path / 'blocked upload-pack.py'
+    helper = tmp_path / 'prepared reference transaction.py'
     helper.write_text(
-        'import os, signal, sys, time\n'
+        'import ctypes, os, sys, time\n'
         'from pathlib import Path\n'
-        'if sys.platform != "win32":\n'
-        '    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+        'updates = sys.stdin.read()\n'
+        'if not updates.strip():\n'
+        '    sys.exit(0)\n'
+        'if sys.platform == "win32":\n'
+        '    kernel = ctypes.WinDLL("kernel32", use_last_error=True)\n'
+        '    if not kernel.SetConsoleCtrlHandler(None, False):\n'
+        '        raise ctypes.WinError(ctypes.get_last_error())\n'
         'ready, release = Path(sys.argv[1]), Path(sys.argv[2])\n'
-        'ready.joinpath(str(os.getpid())).write_text(str(os.getpid()), encoding="ascii")\n'
+        'ready.joinpath(str(os.getpid())).write_text(updates, encoding="ascii")\n'
         'while not release.exists():\n'
         '    time.sleep(0.02)\n',
         encoding='ascii',
-    )
-    upload_pack = shlex.join(
-        [sys.executable, os.fspath(helper), os.fspath(ready), os.fspath(release)]
     )
     executable = (
         getattr(sys, '_base_executable', sys.executable)
         if sys.platform == 'win32'
         else sys.executable
     )
+    transaction = shlex.join([executable, os.fspath(helper), os.fspath(ready), os.fspath(release)])
+    for name in ['a', 'b', 'queued']:
+        hook = workspace / name / '.git' / 'hooks' / 'reference-transaction'
+        hook.write_text(
+            f'#!/bin/sh\nif test "$1" = prepared; then\n  exec {transaction}\nfi\n',
+            encoding='utf-8',
+        )
+        hook.chmod(0o755)
     argv = [
         executable,
         os.fspath(driver),
@@ -127,7 +136,6 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
         '-j',
         '2',
         '--fetch=always',
-        f'--fetch-opt=--upload-pack={upload_pack}',
     ]
     if not buffered:
         argv.append('--unbuffered')
@@ -171,7 +179,6 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = subprocess.SW_HIDE
         creation['startupinfo'] = startup
-    fixture_job = _execution._WindowsJob() if sys.platform == 'win32' else None
     sentinel = subprocess.Popen(
         [getattr(sys, '_base_executable', sys.executable), '-c', 'import time; time.sleep(120)']
     )
@@ -182,19 +189,7 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
     except OSError:
         sentinel.terminate()
         sentinel.wait(timeout=5)
-        if fixture_job is not None:
-            fixture_job.close()
         raise
-    if fixture_job is not None:
-        try:
-            fixture_job.add(process)
-        except OSError:
-            process.kill()
-            process.communicate(timeout=5)
-            sentinel.terminate()
-            sentinel.wait(timeout=5)
-            fixture_job.close()
-            raise
     injector = None
     inject_ready, inject_trigger, inject_sent = [
         tmp_path / name for name in ['inject-ready', 'inject-trigger', 'inject-sent']
@@ -210,6 +205,15 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
         wait_until(both_ready, timeout=120)
         helper_pids = [int(p.name) for p in ready.iterdir()]
         assert sorted(starts.read_text(encoding='utf-8').splitlines()) == ['a', 'b']
+        held_locks = []
+        for name in ['a', 'b']:
+            locks = [
+                lock
+                for lock in (workspace / name / '.git').rglob('*.lock')
+                if lock.name != 'unrelated.lock'
+            ]
+            assert locks, f'{name}: Git must hold a prepared reference transaction'
+            held_locks.extend(locks)
         if sys.platform == 'win32':
             injector = subprocess.Popen(
                 [
@@ -239,14 +243,11 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
         if sys.platform == 'win32':
             inject_trigger.touch()
         else:
-            process.send_signal(signal.SIGINT)
+            os.killpg(process.pid, signal.SIGINT)
         _, stderr = process.communicate(timeout=max(0.1, 10 - (time.monotonic() - start)))
         assert time.monotonic() - start < 10
-        assert b'forcefully stopped' in stderr
-        assert b'Git lock files may remain' in stderr
-        assert b'before removing' in stderr
-        for name in ['a', 'b']:
-            assert str(workspace / name).encode('utf-8') in stderr
+        assert b'forcefully stopped' not in stderr
+        assert b'Git lock files may remain' not in stderr
         if sys.platform == 'win32':
             assert inject_sent.is_file()
             injector.communicate(timeout=3)
@@ -260,6 +261,7 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
         fetches = [p['pid'] for p in owned if p['argv'][1] == 'fetch']
         assert len(fetches) == 2
         assert all(not process_active(pid) for pid in fetches + helper_pids)
+        assert all(not lock.exists() for lock in held_locks)
         assert len(list(ready.iterdir())) == 2
         assert sorted(starts.read_text(encoding='utf-8').splitlines()) == ['a', 'b']
         for name in ['a', 'b', 'queued']:
@@ -271,15 +273,11 @@ def test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buf
     finally:
         release.touch()
         try:
-            if fixture_job is not None:
-                fixture_job.terminate()
             process.communicate(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill()
             process.communicate(timeout=5)
         finally:
-            if fixture_job is not None:
-                fixture_job.close()
             if injector is not None:
                 inject_trigger.touch()
                 try:
@@ -334,7 +332,7 @@ def test_cli_terminal_interrupt_cleans_owned_resources(tmp_path, monkeypatch, bu
 
     monkeypatch.setattr(subprocess, 'Popen', terminal_popen)
     try:
-        test_cli_interrupt_preserves_status_and_cleans_owned_resources(tmp_path, buffered, 'direct')
+        test_cli_terminal_interrupt_reaches_git_and_stops_pending_work(tmp_path, buffered, 'direct')
         assert interrupts == [1]
     finally:
         os.close(master)

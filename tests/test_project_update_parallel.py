@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,6 @@ import threading
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 from conftest import GIT, add_commit, cmd, cmd_subprocess, create_repo, create_workspace, rev_parse
@@ -865,6 +865,7 @@ def test_conflict_groups_do_not_skip_later_metadata_errors(
     tmp_path, monkeypatch, update_command, failure
 ):
     create_repo(tmp_path / 'bad')
+    monkeypatch.setenv('GIT_COMMON_DIR', os.fspath(tmp_path / 'bad' / '.git'))
     projects = [
         Project(name, 'unused', path=path, topdir=tmp_path)
         for name, path in [('alpha', 'outer'), ('bravo', 'outer/inner'), ('charlie', 'bad')]
@@ -917,7 +918,7 @@ def test_conflict_group_failures_preserve_order_and_cancel_pending(
         if project.name == 'charlie':
             ready.set()
             if fatal:
-                assert _current_context()._controller._cancelled.wait(WAIT)
+                assert _current_context()._cancelled.wait(WAIT)
 
     monkeypatch.setattr(update_command, 'update', update)
     if fatal:
@@ -931,6 +932,52 @@ def test_conflict_group_failures_preserve_order_and_cancel_pending(
         assert seen.index('charlie') < seen.index('delta')
         assert update_command.updated == {'bravo', 'charlie', 'delta'}
     assert not any(thread.name.startswith('west-update') for thread in threading.enumerate())
+
+
+def test_buffering_failure_is_not_hidden_by_cancelled_sibling(
+    tmp_path, monkeypatch, update_command
+):
+    from west import _execution
+
+    projects = _projects(tmp_path, names=('alpha', 'bravo'))
+    for project in projects:
+        create_repo(project.abspath)
+    release = tmp_path / 'release'
+    helper = tmp_path / 'emit then wait.py'
+    helper.write_text(
+        'import sys, time\nfrom pathlib import Path\n'
+        'print("spool-failure-marker", flush=True)\n'
+        'while not Path(sys.argv[1]).exists():\n    time.sleep(0.02)\n',
+        encoding='utf-8',
+    )
+    original_write = _execution._ProjectOutput.write_bytes
+    original_shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+
+    def write(output, data, *, python=False):
+        if not python and b'spool-failure-marker' in data:
+            raise OSError('disk failure sentinel')
+        return original_write(output, data, python=python)
+
+    def shutdown(executor, *args, **kwargs):
+        release.touch()
+        return original_shutdown(executor, *args, **kwargs)
+
+    def update(project):
+        if project.name == 'alpha':
+            invocation = shlex.join([sys.executable, os.fspath(helper), os.fspath(release)])
+            project.git(['-c', f'alias.emit=!{invocation}', 'emit'])
+        else:
+            assert _current_context()._cancelled.wait(WAIT)
+            project.git(['rev-parse', 'HEAD'], capture_stdout=True)
+
+    monkeypatch.setattr(_execution._ProjectOutput, 'write_bytes', write)
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, 'shutdown', shutdown)
+    monkeypatch.setattr(update_command, 'update', update)
+    try:
+        with pytest.raises(OSError, match='disk failure sentinel'):
+            update_command._update_projects(projects)
+    finally:
+        release.touch()
 
 
 @pytest.mark.parametrize('existing', [False, True], ids=['missing', 'existing'])
@@ -1097,10 +1144,36 @@ def test_cli_grouped_worktrees_match_serial(tmp_path):
     assert snapshots[0] == snapshots[1] == [(first, second), (second, second), (second, second)]
 
 
+@pytest.mark.parametrize('linked', [False, True], ids=['ordinary', 'worktrees'])
+def test_common_directory_grouping_does_not_spawn_git(
+    tmp_path, monkeypatch, update_command, linked
+):
+    projects = _projects(tmp_path, names=('alpha', 'bravo'))
+    create_repo(projects[0].abspath)
+    if linked:
+        subprocess.run(
+            [GIT, 'worktree', 'add', '--detach', projects[1].abspath, 'HEAD'],
+            cwd=projects[0].abspath,
+            check=True,
+            timeout=GIT_TIMEOUT,
+        )
+    else:
+        create_repo(projects[1].abspath)
+
+    def unexpected_git(*args, **kwargs):
+        pytest.fail('ordinary Git metadata must not require a preflight Git process')
+
+    monkeypatch.setattr(Project, 'git', unexpected_git)
+    groups, conflicts = update_command._parallel_groups(projects)
+    assert groups == ([projects] if linked else [[project] for project in projects])
+    assert bool(conflicts) is linked
+
+
 @pytest.mark.parametrize('failure', ['failed', 'returned-failure', 'empty', 'unusable'])
 def test_bad_common_dir_probe_aborts_batch(tmp_path, monkeypatch, failure):
     workspace = _workspace(tmp_path, _entries(tmp_path))
     create_repo(workspace / 'alpha')
+    monkeypatch.setenv('GIT_COMMON_DIR', os.fspath(workspace / 'alpha' / '.git'))
     unusable = workspace / 'not-a-directory'
     unusable.write_text('not Git metadata', encoding='utf-8')
     errors = io.StringIO()
@@ -1260,12 +1333,7 @@ def test_serial_failures_keep_order_and_allow_siblings(
 
 @pytest.mark.parametrize(
     'resource, primary_failure',
-    [
-        ('cancel', True),
-        ('scope-close', True),
-        ('controller-close', True),
-        ('controller-close', False),
-    ],
+    [('scope-close', True), ('scope-close', False)],
 )
 def test_cleanup_resource_errors_preserve_primary_failure(
     tmp_path, monkeypatch, update_command, capsys, resource, primary_failure
@@ -1273,9 +1341,7 @@ def test_cleanup_resource_errors_preserve_primary_failure(
     from west import _execution
 
     target, method = {
-        'cancel': (_execution.ProcessController, 'cancel'),
         'scope-close': (_execution.ProjectContext, 'close'),
-        'controller-close': (_execution.ProcessController, 'close'),
     }[resource]
     original = getattr(target, method)
     message = f'injected {resource} failure'
@@ -1299,59 +1365,7 @@ def test_cleanup_resource_errors_preserve_primary_failure(
         assert message in str(raised.value.__cause__)
     else:
         assert message in str(raised.value)
-        assert update_command.updated == {'alpha', 'bravo'}
+        assert not update_command.updated
     assert message in capsys.readouterr().err
-    assert _current_context() is None
-    assert not any(thread.name.startswith('west-update') for thread in threading.enumerate())
-
-
-@pytest.mark.parametrize('forced', [False, True])
-@pytest.mark.parametrize('warning_error', [None, BrokenPipeError, ValueError])
-@pytest.mark.parametrize('cancel_error', [False, True])
-def test_forced_git_stop_warns_without_replacing_primary_error(
-    tmp_path, monkeypatch, update_command, capsys, forced, warning_error, cancel_error
-):
-    from west import _execution
-
-    primary = RuntimeError('primary update failure')
-    original_cancel = _execution.ProcessController.cancel
-    warning = Mock(side_effect=warning_error('warning stream failed')) if warning_error else None
-
-    def cancel(controller):
-        original_cancel(controller)
-        controller.forced_termination = forced
-        if cancel_error:
-            raise OSError('injected stop failure')
-
-    def update(project):
-        update_command.err(f'{project.name}: partial Git output')
-        raise primary
-
-    monkeypatch.setattr(_execution.ProcessController, 'cancel', cancel)
-    monkeypatch.setattr(update_command, 'update', update)
-    if warning is not None:
-        monkeypatch.setattr(update_command, 'wrn', warning)
-    with pytest.raises(RuntimeError) as raised:
-        update_command._update_projects(_projects(tmp_path, ('alpha', 'bravo')))
-    assert raised.value is primary
-    errors = capsys.readouterr().err
-    assert 'partial Git output' in errors
-    if cancel_error:
-        assert isinstance(primary.__cause__, OSError)
-        assert 'injected stop failure' in str(primary.__cause__)
-        assert 'stopping owned Git children' in errors
-    if warning is not None:
-        assert warning.call_count == int(forced)
-        if forced:
-            assert isinstance(primary.__cause__, OSError)
-            assert 'warning stream failed' in str(primary.__cause__)
-    elif forced:
-        assert 'forcefully stopped' in errors
-        assert 'lock' in errors
-        assert 'alpha' in errors and str(tmp_path / 'alpha') in errors
-        assert 'bravo' in errors and str(tmp_path / 'bravo') in errors
-        assert 'before removing' in errors
-    else:
-        assert 'forcefully stopped' not in errors
     assert _current_context() is None
     assert not any(thread.name.startswith('west-update') for thread in threading.enumerate())

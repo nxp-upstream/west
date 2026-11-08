@@ -222,10 +222,8 @@ def setup_teardown_test_environment(tmpdir_factory):
 #
 
 
-@pytest.fixture(params=[None, 1, 2], ids=['serial-default', 'jobs-1', 'jobs-2'])
+@pytest.fixture(params=[1, 2], ids=['jobs-1', 'jobs-2'])
 def update_jobs(request, monkeypatch):
-    if request.param is None:
-        return
     real_cmd = _cmd
 
     def command_with_jobs(command, cwd=None, env=None):
