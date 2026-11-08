@@ -299,6 +299,8 @@ def test_cli_terminal_interrupt_cleans_owned_resources(tmp_path, monkeypatch, bu
 
     master, slave = pty.openpty()
     real_popen = subprocess.Popen
+    real_killpg = os.killpg
+    driver_pids = set()
     interrupts = []
 
     def claim_terminal():
@@ -317,20 +319,19 @@ def test_cli_terminal_interrupt_cleans_owned_resources(tmp_path, monkeypatch, bu
             kwargs['preexec_fn'] = claim_terminal
         process = real_popen(args, *popen_args, **kwargs)
         if driver:
-            native_signal = process.send_signal
-
-            def send_signal(signum):
-                if signum == signal.SIGINT:
-                    interrupts.append(os.write(master, b'\x03'))
-                    if select.select([master], [], [], 1)[0]:
-                        os.read(master, 1024)
-                else:
-                    native_signal(signum)
-
-            process.send_signal = send_signal
+            driver_pids.add(process.pid)
         return process
 
+    def terminal_killpg(pgid, signum):
+        if pgid in driver_pids and signum == signal.SIGINT:
+            interrupts.append(os.write(master, b'\x03'))
+            if select.select([master], [], [], 1)[0]:
+                os.read(master, 1024)
+        else:
+            real_killpg(pgid, signum)
+
     monkeypatch.setattr(subprocess, 'Popen', terminal_popen)
+    monkeypatch.setattr(os, 'killpg', terminal_killpg)
     try:
         test_cli_terminal_interrupt_reaches_git_and_stops_pending_work(tmp_path, buffered, 'direct')
         assert interrupts == [1]
